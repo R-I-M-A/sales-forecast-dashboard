@@ -178,6 +178,35 @@ def run_arima_forecast(series_values, series_index_iso, order, steps, freq):
     return fitted, mean_forecast, conf_int
 
 
+@st.cache_data(show_spinner=False)
+def backtest_arima(series_values, series_index_iso, order, holdout_size, freq):
+    """
+    Train ARIMA on all but the last `holdout_size` periods, forecast those
+    held-out periods, and compare against actuals to compute error metrics.
+    Returns (actual_holdout, predicted_holdout, metrics_dict).
+    """
+    full_index = pd.to_datetime(list(series_index_iso))
+    full_series = pd.Series(series_values, index=full_index)
+
+    train = full_series.iloc[:-holdout_size]
+    test = full_series.iloc[-holdout_size:]
+
+    model = ARIMA(train, order=order)
+    fitted = model.fit()
+    forecast_res = fitted.get_forecast(steps=holdout_size)
+    predicted = forecast_res.predicted_mean
+    predicted.index = test.index  # align exactly with the holdout dates
+
+    errors = test.values - predicted.values
+    mae = np.mean(np.abs(errors))
+    rmse = np.sqrt(np.mean(errors ** 2))
+    nonzero_mask = test.values != 0
+    mape = np.mean(np.abs(errors[nonzero_mask] / test.values[nonzero_mask])) * 100 if nonzero_mask.any() else np.nan
+
+    metrics = {"mae": mae, "rmse": rmse, "mape": mape}
+    return test, predicted, metrics
+
+
 def kpi_card(label, value, delta=None):
     st.metric(label, value, delta)
 
@@ -266,6 +295,35 @@ def explain_breakdown(seg: pd.DataFrame, segment_col: str, value_col: str) -> st
     return sentence
 
 
+def explain_backtest(test: pd.Series, predicted: pd.Series, metrics: dict, freq_label: str) -> str:
+    """Generate a plain-English summary of backtest accuracy."""
+    avg_actual = test.mean()
+    mape = metrics["mape"]
+
+    if np.isnan(mape):
+        accuracy_word = "unclear (test period contains zero values, so percentage error can't be computed)"
+    elif mape < 10:
+        accuracy_word = "quite accurate"
+    elif mape < 20:
+        accuracy_word = "reasonably accurate"
+    elif mape < 35:
+        accuracy_word = "moderately accurate, with room for improvement"
+    else:
+        accuracy_word = "not very accurate for this data — consider a different ARIMA order or model"
+
+    sentence = (
+        f"On the last **{len(test)}** {freq_label.lower()} periods held out for testing, "
+        f"the model's predictions were **{accuracy_word}**. "
+        f"On average, forecasts were off by **{_fmt(metrics['mae'])}**"
+    )
+    if not np.isnan(mape):
+        sentence += f" ({mape:.1f}% of the actual value)"
+    sentence += f", with a root-mean-squared error of **{_fmt(metrics['rmse'])}**. "
+    sentence += f"For comparison, the average actual value in this test period was **{_fmt(avg_actual)}**."
+    return sentence
+
+
+
 def explain_forecast(series: pd.Series, mean_forecast: pd.Series, conf_int: pd.DataFrame,
                       order: tuple, freq_label: str, stat_check: dict) -> str:
     """Generate a plain-English summary of an ARIMA forecast chart."""
@@ -306,9 +364,11 @@ def answer_question(question: str, context: dict) -> str:
     """
     q = question.lower()
 
-    if any(k in q for k in ["accura", "confiden", "trust", "reliable"]):
+    if any(k in q for k in ["accura", "confiden", "trust", "reliable", "backtest", "error", "mae", "rmse", "mape"]):
+        if "backtest_explanation" in context:
+            return context["backtest_explanation"]
         if "forecast_explanation" in context:
-            return context["forecast_explanation"]
+            return context["forecast_explanation"] + " (Tip: scroll down to the 'Model Accuracy (Backtest)' section in the Forecast tab for a real accuracy check against held-out data.)"
         return "Run a forecast first in the Forecast tab, then ask me about its accuracy."
 
     if any(k in q for k in ["why", "spike", "drop", "increase", "decrease", "peak", "low"]):
@@ -654,6 +714,71 @@ with tab_forecast:
             csv_bytes = forecast_df.to_csv(index=False).encode()
             st.download_button("⬇️ Download forecast as CSV", csv_bytes, "sales_forecast.csv", "text/csv")
 
+            # ---- BACKTEST / MODEL ACCURACY ----
+            st.markdown("---")
+            st.markdown("#### 📏 Model Accuracy (Backtest)")
+            st.caption(
+                "To check how trustworthy this model is, we hide the most recent periods, "
+                "retrain on the rest, forecast those hidden periods, and compare against what actually happened."
+            )
+
+            max_holdout = max(1, min(12, len(series) - 5))
+            holdout_size = st.slider(
+                "Holdout periods to test on", 1, max_holdout, min(6, max_holdout), key="holdout_slider"
+            )
+
+            if len(series) - holdout_size < 4:
+                st.warning("Not enough historical data to backtest with this holdout size. Try a smaller holdout or upload more data.")
+            else:
+                try:
+                    test_actual, test_predicted, metrics = backtest_arima(
+                        series.values, series_index_iso, order, holdout_size, freq
+                    )
+
+                    bt1, bt2, bt3 = st.columns(3)
+                    with bt1:
+                        kpi_card("MAE (avg error)", f"{metrics['mae']:,.0f}")
+                    with bt2:
+                        kpi_card("RMSE", f"{metrics['rmse']:,.0f}")
+                    with bt3:
+                        kpi_card("MAPE", f"{metrics['mape']:.1f}%" if not np.isnan(metrics['mape']) else "N/A")
+
+                    fig_bt = go.Figure()
+                    fig_bt.add_trace(go.Scatter(
+                        x=series.index[:-holdout_size], y=series.values[:-holdout_size],
+                        mode="lines", name="Training data", line=dict(color="#6b7280", width=1.5)
+                    ))
+                    fig_bt.add_trace(go.Scatter(
+                        x=test_actual.index, y=test_actual.values,
+                        mode="lines+markers", name="Actual (held out)", line=dict(color=ACCENT2, width=3)
+                    ))
+                    fig_bt.add_trace(go.Scatter(
+                        x=test_predicted.index, y=test_predicted.values,
+                        mode="lines+markers", name="Predicted", line=dict(color=ACCENT3, width=3, dash="dash")
+                    ))
+                    fig_bt.update_layout(
+                        template=PLOTLY_TEMPLATE, height=380, margin=dict(l=10, r=10, t=30, b=10),
+                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                        title="Backtest: Predicted vs Actual on held-out periods",
+                    )
+                    st.plotly_chart(fig_bt, width='stretch')
+
+                    backtest_explanation = explain_backtest(test_actual, test_predicted, metrics, freq_label)
+                    st.session_state.insights["backtest_explanation"] = backtest_explanation
+                    st.info(f"💡 **What this shows:** {backtest_explanation}")
+
+                    comparison_df = pd.DataFrame({
+                        "Date": test_actual.index,
+                        "Actual": test_actual.values,
+                        "Predicted": test_predicted.values,
+                        "Error": test_actual.values - test_predicted.values,
+                    })
+                    st.dataframe(comparison_df, width='stretch', hide_index=True)
+
+                except Exception as bt_error:
+                    st.error(f"Backtest failed: {bt_error}")
+
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ---- RAW DATA TAB ----
@@ -680,7 +805,7 @@ with tab_chat:
     suggestions = [
         "What's the overall trend?",
         "Which region is best?",
-        "How accurate is the forecast?",
+        "How accurate is the model (backtest)?",
         "Why did sales spike?",
     ]
     clicked_suggestion = None
