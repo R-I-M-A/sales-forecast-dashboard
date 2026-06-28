@@ -183,6 +183,164 @@ def kpi_card(label, value, delta=None):
 
 
 # --------------------------------------------------------------------------
+# RULE-BASED INSIGHTS ENGINE (no API key needed)
+# --------------------------------------------------------------------------
+def _fmt(n):
+    """Format a number compactly for natural-language sentences."""
+    if pd.isna(n):
+        return "N/A"
+    if abs(n) >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if abs(n) >= 1_000:
+        return f"{n/1_000:.1f}K"
+    return f"{n:,.0f}"
+
+
+def explain_trend_chart(ts: pd.DataFrame, date_col: str, value_col: str, freq_label: str) -> str:
+    """Generate a plain-English summary of a time-series trend chart."""
+    if len(ts) < 2:
+        return "Not enough data points yet to describe a trend."
+
+    vals = ts[value_col].values
+    first, last = vals[0], vals[-1]
+    change_pct = ((last - first) / first * 100) if first != 0 else None
+    peak_idx = int(np.argmax(vals))
+    trough_idx = int(np.argmin(vals))
+    peak_date = ts[date_col].iloc[peak_idx]
+    trough_date = ts[date_col].iloc[trough_idx]
+
+    direction = "risen" if (change_pct or 0) > 2 else ("fallen" if (change_pct or 0) < -2 else "stayed roughly flat")
+
+    sentence = f"Over this {freq_label.lower()} view, sales have {direction}"
+    if change_pct is not None and abs(change_pct) > 2:
+        sentence += f" by about **{abs(change_pct):.0f}%**"
+    sentence += f", from **{_fmt(first)}** to **{_fmt(last)}**. "
+    sentence += f"The highest point was **{_fmt(vals[peak_idx])}** around **{pd.Timestamp(peak_date).strftime('%b %Y')}**, "
+    sentence += f"while the lowest was **{_fmt(vals[trough_idx])}** around **{pd.Timestamp(trough_date).strftime('%b %Y')}**."
+
+    # Volatility note
+    cv = np.std(vals) / np.mean(vals) if np.mean(vals) != 0 else 0
+    if cv > 0.4:
+        sentence += " The series is quite volatile, with large swings between periods."
+    elif cv < 0.1:
+        sentence += " The series is fairly stable, with only minor period-to-period swings."
+
+    return sentence
+
+
+def explain_distribution(df: pd.DataFrame, value_col: str) -> str:
+    """Generate a plain-English summary of a value distribution / histogram."""
+    vals = df[value_col].dropna()
+    mean, median, std = vals.mean(), vals.median(), vals.std()
+    skew = vals.skew()
+
+    shape = "fairly symmetric"
+    if skew > 0.5:
+        shape = "right-skewed — most records are on the lower end, with a few large outliers pulling the average up"
+    elif skew < -0.5:
+        shape = "left-skewed — most records are on the higher end, with a few unusually low values"
+
+    return (
+        f"The typical (median) record is **{_fmt(median)}**, while the average is **{_fmt(mean)}** "
+        f"— {'close to each other' if abs(mean-median) < 0.1*mean else 'noticeably different'}, "
+        f"meaning the distribution is {shape}. Values typically vary by about **±{_fmt(std)}** around the average."
+    )
+
+
+def explain_breakdown(seg: pd.DataFrame, segment_col: str, value_col: str) -> str:
+    """Generate a plain-English summary of a category breakdown bar chart."""
+    seg_sorted = seg.sort_values(value_col, ascending=False).reset_index(drop=True)
+    total = seg_sorted[value_col].sum()
+    top_name = seg_sorted[segment_col].iloc[0]
+    top_val = seg_sorted[value_col].iloc[0]
+    top_share = (top_val / total * 100) if total else 0
+
+    sentence = f"**{top_name}** leads with **{_fmt(top_val)}** ({top_share:.0f}% of the total shown). "
+    if len(seg_sorted) > 1:
+        bottom_name = seg_sorted[segment_col].iloc[-1]
+        bottom_val = seg_sorted[value_col].iloc[-1]
+        sentence += f"**{bottom_name}** trails at **{_fmt(bottom_val)}**. "
+        gap = (top_val / bottom_val) if bottom_val else None
+        if gap and gap > 2:
+            sentence += f"That's roughly **{gap:.1f}x** the difference between the top and bottom {segment_col.lower()}."
+    return sentence
+
+
+def explain_forecast(series: pd.Series, mean_forecast: pd.Series, conf_int: pd.DataFrame,
+                      order: tuple, freq_label: str, stat_check: dict) -> str:
+    """Generate a plain-English summary of an ARIMA forecast chart."""
+    last_actual = series.iloc[-1]
+    next_forecast = mean_forecast.iloc[0]
+    final_forecast = mean_forecast.iloc[-1]
+    change_pct = ((next_forecast - last_actual) / last_actual * 100) if last_actual != 0 else None
+
+    direction = "rise" if (change_pct or 0) > 1 else ("fall" if (change_pct or 0) < -1 else "stay roughly flat")
+    sentence = f"The model expects sales to **{direction}**"
+    if change_pct is not None and abs(change_pct) > 1:
+        sentence += f" by about **{abs(change_pct):.0f}%**"
+    sentence += f" in the next {freq_label.lower()} period, from **{_fmt(last_actual)}** to **{_fmt(next_forecast)}**. "
+    sentence += f"By the end of the forecast window, the projected level is **{_fmt(final_forecast)}**. "
+
+    band_width = (conf_int.iloc[-1, 1] - conf_int.iloc[-1, 0])
+    relative_band = band_width / final_forecast if final_forecast else None
+    if relative_band is not None:
+        if relative_band > 0.5:
+            sentence += "The confidence band is quite wide at the end of the horizon, meaning there's significant uncertainty that far out — treat long-range values as rough estimates. "
+        else:
+            sentence += "The confidence band stays reasonably tight, suggesting the model is fairly confident in this forecast. "
+
+    sentence += f"This uses an ARIMA{order} model"
+    if stat_check.get("stationary") is False:
+        sentence += ", chosen partly because the raw data wasn't stationary (had a trend), so differencing was applied."
+    else:
+        sentence += "."
+
+    return sentence
+
+
+# Keyword-based question answering for the interactive "ask about this chart" box
+def answer_question(question: str, context: dict) -> str:
+    """
+    Very simple rule-based Q&A: matches keywords in the question to canned,
+    but data-driven, explanations using the same stats computed for the charts.
+    """
+    q = question.lower()
+
+    if any(k in q for k in ["accura", "confiden", "trust", "reliable"]):
+        if "forecast_explanation" in context:
+            return context["forecast_explanation"]
+        return "Run a forecast first in the Forecast tab, then ask me about its accuracy."
+
+    if any(k in q for k in ["why", "spike", "drop", "increase", "decrease", "peak", "low"]):
+        if "trend_explanation" in context:
+            return context["trend_explanation"] + " (Note: this is based on overall patterns in your data — for a specific cause like a promotion or event, you'd need to cross-reference your own records.)"
+        return "Upload data and view the Overview tab first so I have a trend to explain."
+
+    if any(k in q for k in ["trend", "growing", "declining", "overall"]):
+        return context.get("trend_explanation", "I don't have a trend computed yet — check the Overview tab.")
+
+    if any(k in q for k in ["distribut", "spread", "histogram", "average", "median", "typical"]):
+        return context.get("distribution_explanation", "I don't have distribution stats yet — check the Overview tab.")
+
+    if any(k in q for k in ["region", "product", "breakdown", "category", "best", "worst", "top", "compare"]):
+        return context.get("breakdown_explanation", "Pick a segment column (like Region or Product) in the column mapping to see a breakdown I can explain.")
+
+    if any(k in q for k in ["arima", "model", "order", "p,d,q", "parameter"]):
+        return context.get(
+            "forecast_explanation",
+            "ARIMA stands for AutoRegressive Integrated Moving Average. The (p,d,q) values control how much it "
+            "looks at past values (p), how much trend-removal/differencing it does (d), and how much it corrects "
+            "based on past forecast errors (q). Run a forecast in the Forecast tab and I can explain your specific result."
+        )
+
+    return (
+        "I can explain the trend chart, the distribution, category breakdowns, or the ARIMA forecast. "
+        "Try asking things like *'what's the overall trend?'*, *'why did sales spike?'*, *'which region is best?'*, "
+        "or *'how accurate is the forecast?'*"
+    )
+
+
+# --------------------------------------------------------------------------
 # SIDEBAR — DATA INPUT
 # --------------------------------------------------------------------------
 with st.sidebar:
@@ -246,6 +404,9 @@ if raw_df is None:
 
 st.markdown(f'<span class="accent-badge">Source: {source_label}</span>', unsafe_allow_html=True)
 
+if "insights" not in st.session_state:
+    st.session_state.insights = {}
+
 # --------------------------------------------------------------------------
 # COLUMN MAPPING
 # --------------------------------------------------------------------------
@@ -303,8 +464,8 @@ st.markdown("<br>", unsafe_allow_html=True)
 # --------------------------------------------------------------------------
 # TABS
 # --------------------------------------------------------------------------
-tab_overview, tab_explore, tab_forecast, tab_data = st.tabs(
-    ["🏠 Overview", "🔍 Explore", "🔮 Forecast", "🗂️ Raw Data"]
+tab_overview, tab_explore, tab_forecast, tab_data, tab_chat = st.tabs(
+    ["🏠 Overview", "🔍 Explore", "🔮 Forecast", "🗂️ Raw Data", "💬 Ask About This Data"]
 )
 
 # ---- OVERVIEW TAB ----
@@ -326,8 +487,11 @@ with tab_overview:
         fig = px.area(ts, x=date_col, y=value_col, template=PLOTLY_TEMPLATE)
         fig.update_traces(line_color=ACCENT, fillcolor="rgba(139,92,246,0.25)")
         fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=380, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         st.caption(f"Showing totals aggregated by **{overview_freq_label.lower()}** period — switch above for more or less detail.")
+        trend_explanation = explain_trend_chart(ts, date_col, value_col, overview_freq_label)
+        st.session_state.insights["trend_explanation"] = trend_explanation
+        st.info(f"💡 **What this shows:** {trend_explanation}")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with col2:
@@ -335,7 +499,10 @@ with tab_overview:
         st.subheader("Distribution")
         fig2 = px.histogram(df, x=value_col, nbins=30, template=PLOTLY_TEMPLATE, color_discrete_sequence=[ACCENT2])
         fig2.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=380, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width='stretch')
+        distribution_explanation = explain_distribution(df, value_col)
+        st.session_state.insights["distribution_explanation"] = distribution_explanation
+        st.info(f"💡 **What this shows:** {distribution_explanation}")
         st.markdown("</div>", unsafe_allow_html=True)
 
     if segment_col != "None":
@@ -345,7 +512,10 @@ with tab_overview:
         fig3 = px.bar(seg, x=segment_col, y=value_col, template=PLOTLY_TEMPLATE, color=segment_col,
                        color_discrete_sequence=px.colors.qualitative.Bold)
         fig3.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=350, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", showlegend=False)
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width='stretch')
+        breakdown_explanation = explain_breakdown(seg, segment_col, value_col)
+        st.session_state.insights["breakdown_explanation"] = breakdown_explanation
+        st.info(f"💡 **What this shows:** {breakdown_explanation}")
         st.markdown("</div>", unsafe_allow_html=True)
 
 # ---- EXPLORE TAB ----
@@ -374,7 +544,7 @@ with tab_explore:
     fig4.update_layout(template=PLOTLY_TEMPLATE, height=420, margin=dict(l=10, r=10, t=30, b=10),
                         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                         legend=dict(orientation="h", yanchor="bottom", y=1.02))
-    st.plotly_chart(fig4, use_container_width=True)
+    st.plotly_chart(fig4, width='stretch')
     st.markdown("</div>", unsafe_allow_html=True)
 
     if segment_col != "None":
@@ -399,7 +569,7 @@ with tab_explore:
                         color_discrete_sequence=px.colors.qualitative.Bold)
         fig5.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                             legend=dict(orientation="h", yanchor="bottom", y=1.02))
-        st.plotly_chart(fig5, use_container_width=True)
+        st.plotly_chart(fig5, width='stretch')
         st.markdown("</div>", unsafe_allow_html=True)
 
 # ---- FORECAST TAB ----
@@ -459,7 +629,10 @@ with tab_forecast:
                                 plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                                 legend=dict(orientation="h", yanchor="bottom", y=1.02),
                                 title=f"ARIMA{order} Forecast — next {horizon} {freq_label.lower()} periods")
-            st.plotly_chart(fig6, use_container_width=True)
+            st.plotly_chart(fig6, width='stretch')
+            forecast_explanation = explain_forecast(series, mean_forecast, conf_int, order, freq_label, stat_check)
+            st.session_state.insights["forecast_explanation"] = forecast_explanation
+            st.info(f"💡 **What this shows:** {forecast_explanation}")
 
             st.markdown("#### Forecast Summary")
             f1, f2, f3 = st.columns(3)
@@ -476,7 +649,7 @@ with tab_forecast:
                 "Lower 80%": conf_int.iloc[:, 0].values,
                 "Upper 80%": conf_int.iloc[:, 1].values,
             })
-            st.dataframe(forecast_df, use_container_width=True, hide_index=True)
+            st.dataframe(forecast_df, width='stretch', hide_index=True)
 
             csv_bytes = forecast_df.to_csv(index=False).encode()
             st.download_button("⬇️ Download forecast as CSV", csv_bytes, "sales_forecast.csv", "text/csv")
@@ -487,8 +660,51 @@ with tab_forecast:
 with tab_data:
     st.markdown('<div class="dash-card">', unsafe_allow_html=True)
     st.subheader("Raw Data")
-    st.dataframe(df, use_container_width=True, height=480)
+    st.dataframe(df, width='stretch', height=480)
     st.caption(f"{len(df):,} rows × {len(df.columns)} columns")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ---- CHATBOT TAB ----
+with tab_chat:
+    st.markdown('<div class="dash-card">', unsafe_allow_html=True)
+    st.subheader("💬 Ask About This Data")
+    st.caption(
+        "This is a free, rule-based assistant — it answers using the real numbers computed from your charts "
+        "(no AI model or API key involved). Visit the Overview and Forecast tabs first so it has things to explain."
+    )
+
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+    suggestion_cols = st.columns(4)
+    suggestions = [
+        "What's the overall trend?",
+        "Which region is best?",
+        "How accurate is the forecast?",
+        "Why did sales spike?",
+    ]
+    clicked_suggestion = None
+    for col, suggestion in zip(suggestion_cols, suggestions):
+        with col:
+            if st.button(suggestion, width='stretch', key=f"sugg_{suggestion}"):
+                clicked_suggestion = suggestion
+
+    user_question = st.chat_input("Ask a question about your charts...")
+    final_question = clicked_suggestion or user_question
+
+    if final_question:
+        answer = answer_question(final_question, st.session_state.insights)
+        st.session_state.chat_history.append(("user", final_question))
+        st.session_state.chat_history.append(("assistant", answer))
+
+    for role, msg in st.session_state.chat_history:
+        with st.chat_message(role):
+            st.markdown(msg)
+
+    if st.session_state.chat_history and st.button("🗑️ Clear chat"):
+        st.session_state.chat_history = []
+        st.rerun()
+
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("<br><hr style='border-color:#232838;'><br>", unsafe_allow_html=True)
