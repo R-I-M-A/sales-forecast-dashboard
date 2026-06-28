@@ -162,13 +162,13 @@ def check_stationarity(series: pd.Series) -> dict:
 
 
 @st.cache_data(show_spinner=False)
-def run_arima_forecast(series_values, series_index_iso, order, steps, freq):
+def run_arima_forecast(series_values, series_index_iso, order, steps, freq, alpha=0.2):
     series = pd.Series(series_values, index=pd.to_datetime(list(series_index_iso)))
     model = ARIMA(series, order=order)
     fitted = model.fit()
     forecast_res = fitted.get_forecast(steps=steps)
     mean_forecast = forecast_res.predicted_mean
-    conf_int = forecast_res.conf_int(alpha=0.2)  # 80% CI
+    conf_int = forecast_res.conf_int(alpha=alpha)
 
     last_date = series.index[-1]
     future_index = pd.date_range(last_date, periods=steps + 1, freq=freq)[1:]
@@ -325,7 +325,7 @@ def explain_backtest(test: pd.Series, predicted: pd.Series, metrics: dict, freq_
 
 
 def explain_forecast(series: pd.Series, mean_forecast: pd.Series, conf_int: pd.DataFrame,
-                      order: tuple, freq_label: str, stat_check: dict) -> str:
+                      order: tuple, freq_label: str, stat_check: dict, confidence_label: str = "80%") -> str:
     """Generate a plain-English summary of an ARIMA forecast chart."""
     last_actual = series.iloc[-1]
     next_forecast = mean_forecast.iloc[0]
@@ -339,13 +339,20 @@ def explain_forecast(series: pd.Series, mean_forecast: pd.Series, conf_int: pd.D
     sentence += f" in the next {freq_label.lower()} period, from **{_fmt(last_actual)}** to **{_fmt(next_forecast)}**. "
     sentence += f"By the end of the forecast window, the projected level is **{_fmt(final_forecast)}**. "
 
-    band_width = (conf_int.iloc[-1, 1] - conf_int.iloc[-1, 0])
+    lower_final = conf_int.iloc[-1, 0]
+    upper_final = conf_int.iloc[-1, 1]
+    band_width = (upper_final - lower_final)
     relative_band = band_width / final_forecast if final_forecast else None
+    sentence += (
+        f"At the **{confidence_label}** confidence level, the model expects the final period to fall "
+        f"somewhere between **{_fmt(lower_final)}** and **{_fmt(upper_final)}**. "
+    )
     if relative_band is not None:
         if relative_band > 0.5:
-            sentence += "The confidence band is quite wide at the end of the horizon, meaning there's significant uncertainty that far out — treat long-range values as rough estimates. "
+            sentence += "That's a fairly wide range, meaning there's significant uncertainty that far out — treat long-range values as rough estimates, not precise predictions. "
         else:
-            sentence += "The confidence band stays reasonably tight, suggesting the model is fairly confident in this forecast. "
+            sentence += "That's a fairly tight range, suggesting the model is reasonably confident in this forecast. "
+    sentence += "Choosing a higher confidence level (like 95% or 99%) would widen this range further, since the model has to cover more possible outcomes to be that sure. "
 
     sentence += f"This uses an ARIMA{order} model"
     if stat_check.get("stationary") is False:
@@ -356,13 +363,182 @@ def explain_forecast(series: pd.Series, mean_forecast: pd.Series, conf_int: pd.D
     return sentence
 
 
-# Keyword-based question answering for the interactive "ask about this chart" box
+# --------------------------------------------------------------------------
+# AUTOMATED INSIGHTS / RECOMMENDATION ENGINE (rule-based, not AI)
+# --------------------------------------------------------------------------
+def generate_recommendations(
+    df: pd.DataFrame, date_col: str, value_col: str, segment_col: str,
+    series: pd.Series = None, mean_forecast: pd.Series = None,
+    backtest_metrics: dict = None, freq_label: str = "Monthly",
+) -> list:
+    """
+    Apply a set of explicit, data-driven business rules to generate
+    prioritized, actionable recommendations. This is deterministic threshold
+    logic, NOT a machine learning or language model — every recommendation
+    here is traceable to a specific numeric rule on the data.
+
+    Returns a list of dicts: {"priority": "high"|"medium"|"info", "text": str, "rule": str}
+    """
+    recs = []
+
+    # --- Rule 1: Seasonal peak detection -> inventory timing ---
+    df_season = df.copy()
+    df_season["_month"] = df_season[date_col].dt.month
+    monthly_avg = df_season.groupby("_month")[value_col].mean()
+    overall_avg = monthly_avg.mean()
+    if len(monthly_avg) >= 6 and overall_avg > 0:
+        peak_month_num = monthly_avg.idxmax()
+        peak_value = monthly_avg.max()
+        peak_uplift = (peak_value - overall_avg) / overall_avg * 100
+        month_name = pd.Timestamp(2000, int(peak_month_num), 1).strftime("%B")
+        if peak_uplift > 20:
+            recs.append({
+                "priority": "high",
+                "rule": "Seasonal peak vs. overall average",
+                "text": (
+                    f"**{month_name}** sales run **{peak_uplift:.0f}% above** the all-month average historically. "
+                    f"Consider increasing inventory/staffing by roughly **{min(peak_uplift, 50):.0f}%** ahead of that period to avoid stockouts."
+                ),
+            })
+        elif peak_uplift > 8:
+            recs.append({
+                "priority": "medium",
+                "rule": "Seasonal peak vs. overall average",
+                "text": (
+                    f"**{month_name}** tends to run **{peak_uplift:.0f}% above** average. Worth a modest "
+                    f"inventory bump heading into that period."
+                ),
+            })
+
+    # --- Rule 2: Trend direction -> growth/decline framing ---
+    if series is not None and len(series) >= 4:
+        first_half = series.iloc[: len(series)//2].mean()
+        second_half = series.iloc[len(series)//2:].mean()
+        if first_half > 0:
+            change_pct = (second_half - first_half) / first_half * 100
+            if change_pct > 15:
+                recs.append({
+                    "priority": "medium",
+                    "rule": "First-half vs second-half average",
+                    "text": (
+                        f"Sales in the more recent half of this period average **{change_pct:.0f}% higher** "
+                        f"than the earlier half — a sustained growth trend. Consider scaling supply chain "
+                        f"and staffing capacity to match, not just short-term seasonal bumps."
+                    ),
+                })
+            elif change_pct < -15:
+                recs.append({
+                    "priority": "high",
+                    "rule": "First-half vs second-half average",
+                    "text": (
+                        f"Sales in the more recent half are **{abs(change_pct):.0f}% lower** than the earlier "
+                        f"half — a sustained decline. Investigate possible causes (pricing changes, competition, "
+                        f"reduced marketing spend, customer churn) rather than assuming it's seasonal noise."
+                    ),
+                })
+
+    # --- Rule 3: Segment under/over-performance ---
+    if segment_col and segment_col != "None" and segment_col in df.columns:
+        seg_totals = df.groupby(segment_col)[value_col].sum().sort_values(ascending=False)
+        if len(seg_totals) >= 2:
+            seg_mean = seg_totals.mean()
+            top_seg, top_val = seg_totals.index[0], seg_totals.iloc[0]
+            bottom_seg, bottom_val = seg_totals.index[-1], seg_totals.iloc[-1]
+            if seg_mean > 0:
+                bottom_gap_pct = (seg_mean - bottom_val) / seg_mean * 100
+                top_gap_pct = (top_val - seg_mean) / seg_mean * 100
+                if bottom_gap_pct > 35:
+                    recs.append({
+                        "priority": "high",
+                        "rule": f"{segment_col} below-average performance",
+                        "text": (
+                            f"**{bottom_seg}** is **{bottom_gap_pct:.0f}% below** the average {segment_col.lower()} "
+                            f"in total sales. Investigate causes — pricing, local competition, stock availability, "
+                            f"or customer churn in that {segment_col.lower()}."
+                        ),
+                    })
+                if top_gap_pct > 35:
+                    recs.append({
+                        "priority": "info",
+                        "rule": f"{segment_col} above-average performance",
+                        "text": (
+                            f"**{top_seg}** is **{top_gap_pct:.0f}% above** the {segment_col.lower()} average. "
+                            f"Consider studying what's working there (promotions, demand drivers) to replicate elsewhere."
+                        ),
+                    })
+
+    # --- Rule 4: Forecast trajectory -> proactive planning ---
+    if mean_forecast is not None and series is not None and len(series) > 0:
+        last_actual = series.iloc[-1]
+        forecast_change = (mean_forecast.iloc[-1] - last_actual) / last_actual * 100 if last_actual != 0 else 0
+        if forecast_change > 15:
+            recs.append({
+                "priority": "medium",
+                "rule": "Forecast trajectory vs latest actual",
+                "text": (
+                    f"The forecast projects **{forecast_change:.0f}% growth** by the end of the horizon. "
+                    f"If reliable, plan procurement and staffing increases ahead of that demand rather than reactively."
+                ),
+            })
+        elif forecast_change < -15:
+            recs.append({
+                "priority": "high",
+                "rule": "Forecast trajectory vs latest actual",
+                "text": (
+                    f"The forecast projects a **{abs(forecast_change):.0f}% decline** by the end of the horizon. "
+                    f"Consider scenario planning — e.g. promotions, cost control — in case the trend materializes."
+                ),
+            })
+
+    # --- Rule 5: Model trust check based on backtest accuracy ---
+    if backtest_metrics is not None and not np.isnan(backtest_metrics.get("mape", np.nan)):
+        mape = backtest_metrics["mape"]
+        if mape > 30:
+            recs.append({
+                "priority": "high",
+                "rule": "Backtest MAPE threshold",
+                "text": (
+                    f"The model's backtested error (MAPE) is **{mape:.0f}%**, which is high. "
+                    f"Treat forecast-based recommendations above with caution — consider trying a different "
+                    f"ARIMA order, more historical data, or a different aggregation period before acting on them."
+                ),
+            })
+        elif mape < 10:
+            recs.append({
+                "priority": "info",
+                "rule": "Backtest MAPE threshold",
+                "text": (
+                    f"The model's backtested error (MAPE) is a low **{mape:.0f}%**, meaning the forecast-driven "
+                    f"recommendations above carry reasonably high confidence."
+                ),
+            })
+
+    if not recs:
+        recs.append({
+            "priority": "info",
+            "rule": "No threshold triggered",
+            "text": "No strong signals crossed the recommendation thresholds yet — your data looks broadly stable. Check back as you add more history or after running a forecast.",
+        })
+
+    priority_order = {"high": 0, "medium": 1, "info": 2}
+    recs.sort(key=lambda r: priority_order.get(r["priority"], 3))
+    return recs
+
+
+
 def answer_question(question: str, context: dict) -> str:
     """
     Very simple rule-based Q&A: matches keywords in the question to canned,
     but data-driven, explanations using the same stats computed for the charts.
     """
     q = question.lower()
+
+    if any(k in q for k in ["recommend", "should i", "action", "advice", "what to do", "suggest", "inventory", "investigate"]):
+        return context.get(
+            "recommendations_summary",
+            "Visit the 📋 Recommendations tab — it runs a set of business-rule checks (seasonality, trend, "
+            "segment performance, forecast trajectory, model accuracy) and lists prioritized, data-driven suggestions.",
+        )
 
     if any(k in q for k in ["accura", "confiden", "trust", "reliable", "backtest", "error", "mae", "rmse", "mape"]):
         if "backtest_explanation" in context:
@@ -415,6 +591,13 @@ with st.sidebar:
     freq = freq_map[freq_label]
 
     horizon = st.slider("Forecast horizon (periods ahead)", 3, 36, 12)
+
+    confidence_label = st.selectbox(
+        "Confidence interval", ["80%", "90%", "95%", "99%"], index=0,
+        help="Wider intervals (95%, 99%) are more cautious — they're more likely to contain the true future value, but the range is wider and less precise.",
+    )
+    confidence_level = int(confidence_label.strip("%")) / 100
+    alpha = 1 - confidence_level  # e.g. 95% confidence -> alpha=0.05
 
     st.markdown("**ARIMA order (p, d, q)**")
     c1, c2, c3 = st.columns(3)
@@ -524,8 +707,8 @@ st.markdown("<br>", unsafe_allow_html=True)
 # --------------------------------------------------------------------------
 # TABS
 # --------------------------------------------------------------------------
-tab_overview, tab_explore, tab_forecast, tab_data, tab_chat = st.tabs(
-    ["🏠 Overview", "🔍 Explore", "🔮 Forecast", "🗂️ Raw Data", "💬 Ask About This Data"]
+tab_overview, tab_explore, tab_forecast, tab_recs, tab_data, tab_chat = st.tabs(
+    ["🏠 Overview", "🔍 Explore", "🔮 Forecast", "📋 Recommendations", "🗂️ Raw Data", "💬 Ask About This Data"]
 )
 
 # ---- OVERVIEW TAB ----
@@ -657,14 +840,14 @@ with tab_forecast:
         series_index_iso = tuple(series.index.strftime("%Y-%m-%d"))
         try:
             fitted_model, mean_forecast, conf_int = run_arima_forecast(
-                series.values, series_index_iso, order, horizon, freq
+                series.values, series_index_iso, order, horizon, freq, alpha
             )
         except Exception as e:
             if auto_order:
                 try:
                     fallback_order = (1, 1, 1)
                     fitted_model, mean_forecast, conf_int = run_arima_forecast(
-                        series.values, series_index_iso, fallback_order, horizon, freq
+                        series.values, series_index_iso, fallback_order, horizon, freq, alpha
                     )
                     st.info(f"Order {order} failed ({e}). Used fallback order {fallback_order} instead.")
                     order = fallback_order
@@ -674,6 +857,8 @@ with tab_forecast:
                 st.error(f"ARIMA fitting failed with order {order}: {e}")
 
         if mean_forecast is not None:
+            st.session_state["forecast_series"] = series
+            st.session_state["forecast_mean"] = mean_forecast
             fig6 = go.Figure()
             fig6.add_trace(go.Scatter(x=series.index, y=series.values, mode="lines", name="Historical",
                                        line=dict(color=ACCENT2, width=2)))
@@ -683,14 +868,14 @@ with tab_forecast:
                 x=list(conf_int.index) + list(conf_int.index[::-1]),
                 y=list(conf_int.iloc[:, 1]) + list(conf_int.iloc[:, 0][::-1]),
                 fill="toself", fillcolor="rgba(52,211,153,0.15)", line=dict(color="rgba(0,0,0,0)"),
-                name="80% Confidence Interval", showlegend=True,
+                name=f"{confidence_label} Confidence Interval", showlegend=True,
             ))
             fig6.update_layout(template=PLOTLY_TEMPLATE, height=460, margin=dict(l=10, r=10, t=30, b=10),
                                 plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                                 legend=dict(orientation="h", yanchor="bottom", y=1.02),
                                 title=f"ARIMA{order} Forecast — next {horizon} {freq_label.lower()} periods")
             st.plotly_chart(fig6, width='stretch')
-            forecast_explanation = explain_forecast(series, mean_forecast, conf_int, order, freq_label, stat_check)
+            forecast_explanation = explain_forecast(series, mean_forecast, conf_int, order, freq_label, stat_check, confidence_label)
             st.session_state.insights["forecast_explanation"] = forecast_explanation
             st.info(f"💡 **What this shows:** {forecast_explanation}")
 
@@ -706,8 +891,8 @@ with tab_forecast:
             forecast_df = pd.DataFrame({
                 "Date": mean_forecast.index,
                 "Forecast": mean_forecast.values,
-                "Lower 80%": conf_int.iloc[:, 0].values,
-                "Upper 80%": conf_int.iloc[:, 1].values,
+                f"Lower {confidence_label}": conf_int.iloc[:, 0].values,
+                f"Upper {confidence_label}": conf_int.iloc[:, 1].values,
             })
             st.dataframe(forecast_df, width='stretch', hide_index=True)
 
@@ -766,6 +951,7 @@ with tab_forecast:
 
                     backtest_explanation = explain_backtest(test_actual, test_predicted, metrics, freq_label)
                     st.session_state.insights["backtest_explanation"] = backtest_explanation
+                    st.session_state["backtest_metrics"] = metrics
                     st.info(f"💡 **What this shows:** {backtest_explanation}")
 
                     comparison_df = pd.DataFrame({
@@ -778,6 +964,57 @@ with tab_forecast:
 
                 except Exception as bt_error:
                     st.error(f"Backtest failed: {bt_error}")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ---- RECOMMENDATIONS TAB ----
+with tab_recs:
+    st.markdown('<div class="dash-card">', unsafe_allow_html=True)
+    st.subheader("📋 Automated Recommendations")
+    st.caption(
+        "**Important:** these are generated by explicit, transparent business rules (thresholds on growth, "
+        "seasonality, segment performance, and model accuracy) — not by a machine learning or language model. "
+        "Each one shows which rule triggered it, so you can verify the logic yourself."
+    )
+
+    recs = generate_recommendations(
+        df, date_col, value_col, segment_col,
+        series=st.session_state.get("forecast_series"),
+        mean_forecast=st.session_state.get("forecast_mean"),
+        backtest_metrics=st.session_state.get("backtest_metrics"),
+        freq_label=freq_label,
+    )
+
+    high_priority_texts = [r["text"] for r in recs if r["priority"] == "high"]
+    if high_priority_texts:
+        recs_summary = "Top priority recommendations: " + " ".join(high_priority_texts)
+    else:
+        recs_summary = "No high-priority issues flagged. " + (recs[0]["text"] if recs else "")
+    st.session_state.insights["recommendations_summary"] = recs_summary
+
+    priority_styles = {
+        "high": ("🔴", "#ef4444", "High priority"),
+        "medium": ("🟡", "#f59e0b", "Medium priority"),
+        "info": ("🟢", "#22d3ee", "Informational"),
+    }
+
+    for rec in recs:
+        icon, color, label = priority_styles.get(rec["priority"], ("⚪", "#9ca3af", "Note"))
+        st.markdown(
+            f"""
+            <div style="border-left: 4px solid {color}; background: #1a1f2e; border-radius: 8px;
+                        padding: 12px 16px; margin-bottom: 12px;">
+                <div style="font-size:12px; font-weight:700; color:{color}; margin-bottom:4px;">
+                    {icon} {label} &nbsp;·&nbsp; <span style="color:#9ca3af; font-weight:500;">Rule: {rec['rule']}</span>
+                </div>
+                <div style="color:#e5e7eb; font-size:15px; line-height:1.5;">{rec['text']}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    if st.session_state.get("forecast_mean") is None:
+        st.caption("ℹ️ Visit the **Forecast** tab and run a forecast (and backtest) first to unlock forecast- and accuracy-based recommendations too.")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -804,7 +1041,7 @@ with tab_chat:
     suggestion_cols = st.columns(4)
     suggestions = [
         "What's the overall trend?",
-        "Which region is best?",
+        "What should I do next?",
         "How accurate is the model (backtest)?",
         "Why did sales spike?",
     ]
